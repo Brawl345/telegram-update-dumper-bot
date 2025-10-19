@@ -49,14 +49,14 @@ in
       wantedBy = [ "multi-user.target" ];
 
       script = ''
-        export BOT_TOKEN="$(< $CREDENTIALS_DIRECTORY/BOT_TOKEN )"
+        export TELEGRAM_BOT_TOKEN="$(< $CREDENTIALS_DIRECTORY/TELEGRAM_BOT_TOKEN )"
 
         exec ${cfg.package}/bin/telegram-update-dumper-bot
       '';
 
       serviceConfig = {
         LoadCredential = [
-          "BOT_TOKEN:${cfg.botTokenFile}"
+          "TELEGRAM_BOT_TOKEN:${cfg.botTokenFile}"
         ];
 
         Restart = "always";
