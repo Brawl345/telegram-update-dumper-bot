@@ -26,7 +26,7 @@
       };
 
       overlays.default = final: prev: {
-        telegram-update-dumper-bot = self.packages.${prev.system}.default;
+        telegram-update-dumper-bot = self.packages.${prev.stdenv.hostPlatform.system}.default;
       };
 
       devShells = forAllSystems (pkgs: {
@@ -59,7 +59,7 @@
           };
         };
 
-        default = self.packages.${pkgs.system}.telegram-update-dumper-bot;
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.telegram-update-dumper-bot;
       });
     };
 }

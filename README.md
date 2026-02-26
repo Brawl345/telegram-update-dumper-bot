@@ -4,7 +4,7 @@ Replies to every (private) message with the update JSON from the Telegram Bot AP
 
 This is the code that powers [@dumptgjsonbot](https://t.me/dumptgjsonbot).
 
-100% coded by GLM-4.6 and Codex.
+100% coded by GLM-4.6 and Codex. Improved by Claude 4.6 Sonnet.
 
 ## Running
 

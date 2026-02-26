@@ -16,6 +16,61 @@ import (
 	"time"
 )
 
+const (
+	longPollTimeout  = 30
+	httpClientTTL    = 35 * time.Second
+	apiActionTimeout = 10 * time.Second
+	apiSendTimeout   = 30 * time.Second
+	getUpdatesCtxTTL = 35 * time.Second
+	retryDelay       = 5 * time.Second
+)
+
+var client = &http.Client{Timeout: httpClientTTL}
+
+type (
+	Chat struct {
+		ID int64 `json:"id"`
+	}
+
+	Message struct {
+		MessageID int  `json:"message_id"`
+		Chat      Chat `json:"chat"`
+	}
+
+	BotInfo struct {
+		ID       int64  `json:"id"`
+		Username string `json:"username"`
+		Name     string `json:"first_name"`
+	}
+
+	Update struct {
+		UpdateID      int     `json:"update_id"`
+		Message       Message `json:"message"`
+		EditedMessage Message `json:"edited_message"`
+		RawJSON       string
+	}
+
+	botInfoResponse struct {
+		OK          bool    `json:"ok"`
+		Result      BotInfo `json:"result"`
+		Description string  `json:"description"`
+	}
+
+	updatesResponse struct {
+		OK     bool              `json:"ok"`
+		Result []json.RawMessage `json:"result"`
+	}
+
+	apiResponse struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+
+	ReplyParameters struct {
+		MessageID int `json:"message_id"`
+	}
+)
+
 func main() {
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if botToken == "" {
@@ -31,10 +86,6 @@ func main() {
 	}
 	log.Printf("Started %s (@%s, %d)!", userInfo.Name, userInfo.Username, userInfo.ID)
 
-	httpClient := &http.Client{
-		Timeout: 35 * time.Second, // Slightly longer than getUpdates timeout
-	}
-
 	var lastUpdateID int
 
 	for {
@@ -45,7 +96,7 @@ func main() {
 		default:
 		}
 
-		updates, err := getUpdates(ctx, httpClient, botToken, lastUpdateID+1)
+		updates, err := getUpdates(ctx, botToken, lastUpdateID+1)
 		if err != nil {
 			if ctx.Err() != nil {
 				log.Println("Shutdown signal received, exiting")
@@ -53,65 +104,44 @@ func main() {
 			}
 
 			log.Printf("Error fetching updates: %v", err)
-			time.Sleep(5 * time.Second)
+			time.Sleep(retryDelay)
 			continue
 		}
 
 		for _, update := range updates {
 			lastUpdateID = update.UpdateID
 
+			var chatID int64
+			var messageID int
+			var filename string
+
 			if update.Message.Chat.ID != 0 && update.Message.MessageID != 0 {
-				if err := sendChatAction(ctx, httpClient, update.Message.Chat.ID, "upload_document"); err != nil {
-					log.Printf("Error sending chat action: %v", err)
-				}
-				filename := fmt.Sprintf("telegram_update_%d.json", update.UpdateID)
-				if err := sendDocument(ctx, httpClient, update.Message.Chat.ID, filename, update.RawJSON, update.Message.MessageID); err != nil {
-					log.Printf("Error sending file: %v", err)
-				}
+				chatID = update.Message.Chat.ID
+				messageID = update.Message.MessageID
+				filename = fmt.Sprintf("telegram_update_%d.json", update.UpdateID)
 			} else if update.EditedMessage.Chat.ID != 0 && update.EditedMessage.MessageID != 0 {
-				if err := sendChatAction(ctx, httpClient, update.EditedMessage.Chat.ID, "upload_document"); err != nil {
-					log.Printf("Error sending chat action: %v", err)
-				}
-				filename := fmt.Sprintf("telegram_edited_update_%d.json", update.UpdateID)
-				if err := sendDocument(ctx, httpClient, update.EditedMessage.Chat.ID, filename, update.RawJSON, update.EditedMessage.MessageID); err != nil {
-					log.Printf("Error sending file: %v", err)
-				}
+				chatID = update.EditedMessage.Chat.ID
+				messageID = update.EditedMessage.MessageID
+				filename = fmt.Sprintf("telegram_edited_update_%d.json", update.UpdateID)
+			}
+
+			if chatID == 0 {
+				continue
+			}
+
+			if err := sendChatAction(ctx, botToken, chatID, "upload_document"); err != nil {
+				log.Printf("Error sending chat action: %v", err)
+			}
+			if err := sendDocument(ctx, botToken, chatID, filename, update.RawJSON, messageID); err != nil {
+				log.Printf("Error sending file: %v", err)
 			}
 		}
 	}
 }
 
-type Message struct {
-	MessageID int `json:"message_id"`
-	Chat      struct {
-		ID int64 `json:"id"`
-	} `json:"chat"`
-}
-
-type EditedMessage struct {
-	MessageID int `json:"message_id"`
-	Chat      struct {
-		ID int64 `json:"id"`
-	} `json:"chat"`
-}
-
-type BotInfo struct {
-	ID       int64  `json:"id"`
-	Username string `json:"username"`
-	Name     string `json:"first_name"`
-}
-
-type Update struct {
-	UpdateID      int           `json:"update_id"`
-	Message       Message       `json:"message"`
-	EditedMessage EditedMessage `json:"edited_message"`
-	RawJSON       string
-}
-
 func getBotInfo(botToken string) (*BotInfo, error) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", botToken)
 
-	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("API request error: %v", err)
@@ -123,12 +153,7 @@ func getBotInfo(botToken string) (*BotInfo, error) {
 		return nil, fmt.Errorf("error reading response: %v", err)
 	}
 
-	var result struct {
-		OK          bool    `json:"ok"`
-		Result      BotInfo `json:"result"`
-		Description string  `json:"description"`
-	}
-
+	var result botInfoResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("error parsing JSON response: %v", err)
 	}
@@ -140,12 +165,7 @@ func getBotInfo(botToken string) (*BotInfo, error) {
 	return &result.Result, nil
 }
 
-func sendChatAction(parentCtx context.Context, client *http.Client, chatID int64, action string) error {
-	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if botToken == "" {
-		return fmt.Errorf("TELEGRAM_BOT_TOKEN not set")
-	}
-
+func sendChatAction(parentCtx context.Context, botToken string, chatID int64, action string) error {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendChatAction", botToken)
 
 	payload := map[string]any{
@@ -158,53 +178,22 @@ func sendChatAction(parentCtx context.Context, client *http.Client, chatID int64
 		return fmt.Errorf("error marshaling payload: %v", err)
 	}
 
-	ctxWithTimeout, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(parentCtx, apiActionTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctxWithTimeout, "POST", url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("error creating request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("error sending request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("error reading response: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram API returned status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var apiResp struct {
-		OK          bool   `json:"ok"`
-		Description string `json:"description"`
-	}
-
-	if err := json.Unmarshal(respBody, &apiResp); err != nil {
-		return fmt.Errorf("error parsing response: %v", err)
-	}
-
-	if !apiResp.OK {
-		if apiResp.Description != "" {
-			return fmt.Errorf("telegram API error: %s", apiResp.Description)
-		}
-		return fmt.Errorf("telegram API returned ok=false without description")
-	}
-
-	return nil
+	return doAPIRequest(req)
 }
 
-func getUpdates(parentCtx context.Context, client *http.Client, botToken string, offset int) ([]Update, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", botToken, offset)
+func getUpdates(parentCtx context.Context, botToken string, offset int) ([]Update, error) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=%d", botToken, offset, longPollTimeout)
 
-	ctx, cancel := context.WithTimeout(parentCtx, 35*time.Second)
+	ctx, cancel := context.WithTimeout(parentCtx, getUpdatesCtxTTL)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -227,11 +216,7 @@ func getUpdates(parentCtx context.Context, client *http.Client, botToken string,
 		return nil, fmt.Errorf("telegram API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result struct {
-		OK     bool              `json:"ok"`
-		Result []json.RawMessage `json:"result"`
-	}
-
+	var result updatesResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("error parsing JSON response: %v", err)
 	}
@@ -241,35 +226,20 @@ func getUpdates(parentCtx context.Context, client *http.Client, botToken string,
 	}
 
 	var updates []Update
-	for _, rawUpdate := range result.Result {
-		var update struct {
-			UpdateID      int           `json:"update_id"`
-			Message       Message       `json:"message"`
-			EditedMessage EditedMessage `json:"edited_message"`
-		}
-
-		if err := json.Unmarshal(rawUpdate, &update); err != nil {
+	for _, raw := range result.Result {
+		var update Update
+		if err := json.Unmarshal(raw, &update); err != nil {
 			log.Printf("Error parsing update: %v", err)
 			continue
 		}
-
-		updates = append(updates, Update{
-			UpdateID:      update.UpdateID,
-			Message:       update.Message,
-			EditedMessage: update.EditedMessage,
-			RawJSON:       string(rawUpdate),
-		})
+		update.RawJSON = string(raw)
+		updates = append(updates, update)
 	}
 
 	return updates, nil
 }
 
-func sendDocument(parentCtx context.Context, client *http.Client, chatID int64, filename, content string, messageID int) error {
-	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if botToken == "" {
-		return fmt.Errorf("TELEGRAM_BOT_TOKEN not set")
-	}
-
+func sendDocument(parentCtx context.Context, botToken string, chatID int64, filename, content string, messageID int) error {
 	var requestBody bytes.Buffer
 	writer := multipart.NewWriter(&requestBody)
 
@@ -277,12 +247,7 @@ func sendDocument(parentCtx context.Context, client *http.Client, chatID int64, 
 		return fmt.Errorf("error writing chat_id field: %v", err)
 	}
 
-	replyParams := struct {
-		MessageID int `json:"message_id"`
-	}{
-		MessageID: messageID,
-	}
-	replyParamsJSON, err := json.Marshal(replyParams)
+	replyParamsJSON, err := json.Marshal(ReplyParameters{MessageID: messageID})
 	if err != nil {
 		return fmt.Errorf("error marshaling reply parameters: %v", err)
 	}
@@ -295,8 +260,7 @@ func sendDocument(parentCtx context.Context, client *http.Client, chatID int64, 
 		return fmt.Errorf("error creating form file field: %v", err)
 	}
 
-	formattedJSON := formatJSON(content)
-	if _, err := io.Copy(part, strings.NewReader(formattedJSON)); err != nil {
+	if _, err := io.Copy(part, strings.NewReader(formatJSON(content))); err != nil {
 		return fmt.Errorf("error writing file data: %v", err)
 	}
 
@@ -306,37 +270,36 @@ func sendDocument(parentCtx context.Context, client *http.Client, chatID int64, 
 
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botToken)
 
-	ctxWithTimeout, cancel := context.WithTimeout(parentCtx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(parentCtx, apiSendTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctxWithTimeout, "POST", url, &requestBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, &requestBody)
 	if err != nil {
 		return fmt.Errorf("error creating request: %v", err)
 	}
-
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
+	return doAPIRequest(req)
+}
+
+func doAPIRequest(req *http.Request) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("error sending request: %v", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("error reading response: %v", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram API returned status %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var apiResp struct {
-		OK          bool   `json:"ok"`
-		Description string `json:"description"`
-	}
-
-	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+	var apiResp apiResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
 		return fmt.Errorf("error parsing response: %v", err)
 	}
 
@@ -350,12 +313,10 @@ func sendDocument(parentCtx context.Context, client *http.Client, chatID int64, 
 	return nil
 }
 
-func formatJSON(jsonStr string) string {
-	var data any
-	if err := json.Unmarshal([]byte(jsonStr), &data); err == nil {
-		if formatted, err := json.MarshalIndent(data, "", "  "); err == nil {
-			return string(formatted)
-		}
+func formatJSON(src string) string {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, []byte(src), "", "  "); err == nil {
+		return buf.String()
 	}
-	return jsonStr
+	return src
 }
