@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -100,6 +101,50 @@ type (
 	}
 )
 
+// rateLimiter enforces a sliding-window limit of maxEvents per window duration
+// for each chat ID. Stale timestamps are evicted lazily on each call to Allow,
+// so no background goroutine is required.
+type rateLimiter struct {
+	mu        sync.Mutex
+	entries   map[int64][]time.Time
+	maxEvents int
+	window    time.Duration
+}
+
+func newRateLimiter(maxEvents int, window time.Duration) *rateLimiter {
+	return &rateLimiter{
+		entries:   make(map[int64][]time.Time),
+		maxEvents: maxEvents,
+		window:    window,
+	}
+}
+
+// Allow returns true if the chat is within its rate limit and records the
+// current call. It returns false (without recording) when the limit is exceeded.
+func (r *rateLimiter) Allow(chatID int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-r.window)
+
+	// Evict timestamps that have fallen outside the window.
+	times := r.entries[chatID]
+	start := 0
+	for start < len(times) && times[start].Before(cutoff) {
+		start++
+	}
+	times = times[start:]
+
+	if len(times) >= r.maxEvents {
+		r.entries[chatID] = times // store pruned slice even when rejecting
+		return false
+	}
+
+	r.entries[chatID] = append(times, now)
+	return true
+}
+
 func main() {
 	rawToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if rawToken == "" {
@@ -110,6 +155,9 @@ func main() {
 	// Create the HTTP client here and pass it explicitly to every API function
 	// to keep the scope of the client clear and prevent unintended reuse.
 	httpClient := &http.Client{Timeout: httpClientTTL}
+
+	// Allow each chat/group up to 60 responses per minute.
+	limiter := newRateLimiter(60, time.Minute)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -170,6 +218,11 @@ func main() {
 			}
 
 			if chatID == 0 {
+				continue
+			}
+
+			if !limiter.Allow(chatID) {
+				log.Printf("Rate limit exceeded for chat %d, dropping update %d", chatID, update.UpdateID)
 				continue
 			}
 
