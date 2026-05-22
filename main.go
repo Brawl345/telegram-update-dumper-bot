@@ -29,6 +29,9 @@ const (
 	retryBaseDelay   = 5 * time.Second
 	retryMaxDelay    = 5 * time.Minute
 	maxBodyBytes     = 10 << 20 // 10 MB
+	// maxRetryAfter is the longest retry_after we will honour automatically.
+	// Requests whose retry_after exceeds this value are failed immediately.
+	maxRetryAfter    = 60 * time.Second
 )
 
 // tokenURLPattern matches /bot<token>/ segments in URLs so they can be redacted
@@ -91,9 +94,16 @@ type (
 		Result []json.RawMessage `json:"result"`
 	}
 
+	// ResponseParameters mirrors the Telegram API ResponseParameters object.
+	// It is present on error responses that carry extra context, e.g. retry_after.
+	ResponseParameters struct {
+		RetryAfter int `json:"retry_after,omitempty"`
+	}
+
 	apiResponse struct {
-		OK          bool   `json:"ok"`
-		Description string `json:"description"`
+		OK          bool                `json:"ok"`
+		Description string              `json:"description"`
+		Parameters  *ResponseParameters `json:"parameters,omitempty"`
 	}
 
 	ReplyParameters struct {
@@ -380,34 +390,70 @@ func sendDocument(parentCtx context.Context, httpClient *http.Client, botToken B
 }
 
 func doAPIRequest(httpClient *http.Client, req *http.Request) error {
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("error sending request: %w", sanitizeError(err))
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
-	if err != nil {
-		return fmt.Errorf("error reading response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var apiResp apiResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return fmt.Errorf("error parsing response: %w", err)
-	}
-
-	if !apiResp.OK {
-		if apiResp.Description != "" {
-			return fmt.Errorf("telegram API error: %s", apiResp.Description)
+	for {
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("error sending request: %w", sanitizeError(err))
 		}
-		return fmt.Errorf("telegram API returned ok=false without description")
-	}
 
-	return nil
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		resp.Body.Close()
+		if err != nil {
+			return fmt.Errorf("error reading response: %w", err)
+		}
+
+		var apiResp apiResponse
+		if jsonErr := json.Unmarshal(body, &apiResp); jsonErr != nil {
+			// Can't parse body — surface the HTTP status if it's informative.
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("telegram API returned status %d: %s", resp.StatusCode, string(body))
+			}
+			return fmt.Errorf("error parsing response: %w", jsonErr)
+		}
+
+		// Handle Telegram flood control: HTTP 429 with a retry_after hint.
+		if resp.StatusCode == http.StatusTooManyRequests &&
+			apiResp.Parameters != nil && apiResp.Parameters.RetryAfter > 0 {
+
+			wait := time.Duration(apiResp.Parameters.RetryAfter) * time.Second
+			if wait > maxRetryAfter {
+				return fmt.Errorf("telegram flood control: retry_after %ds exceeds maximum %.0fs, giving up",
+					apiResp.Parameters.RetryAfter, maxRetryAfter.Seconds())
+			}
+
+			log.Printf("Telegram flood control: waiting %s before retrying", wait)
+			select {
+			case <-req.Context().Done():
+				return req.Context().Err()
+			case <-time.After(wait):
+			}
+
+			// Reset the request body so it can be re-read on the next attempt.
+			// http.NewRequestWithContext sets GetBody automatically for bytes.Buffer
+			// and bytes.NewBuffer bodies, so this works without caller changes.
+			if req.GetBody != nil {
+				newBody, err := req.GetBody()
+				if err != nil {
+					return fmt.Errorf("error rebuilding request body for retry: %w", err)
+				}
+				req.Body = newBody
+			}
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("telegram API returned status %d: %s", resp.StatusCode, string(body))
+		}
+
+		if !apiResp.OK {
+			if apiResp.Description != "" {
+				return fmt.Errorf("telegram API error: %s", apiResp.Description)
+			}
+			return fmt.Errorf("telegram API returned ok=false without description")
+		}
+
+		return nil
+	}
 }
 
 func formatJSON(src string) string {
