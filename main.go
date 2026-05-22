@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -22,10 +25,36 @@ const (
 	apiActionTimeout = 10 * time.Second
 	apiSendTimeout   = 30 * time.Second
 	getUpdatesCtxTTL = 35 * time.Second
-	retryDelay       = 5 * time.Second
+	retryBaseDelay   = 5 * time.Second
+	retryMaxDelay    = 5 * time.Minute
+	maxBodyBytes     = 10 << 20 // 10 MB
 )
 
-var client = &http.Client{Timeout: httpClientTTL}
+// tokenURLPattern matches /bot<token>/ segments in URLs so they can be redacted
+// from error messages before those messages are logged.
+var tokenURLPattern = regexp.MustCompile(`/bot[^/?#\s]+/`)
+
+// BotToken is an opaque wrapper for the Telegram bot token.
+// Its String and GoString methods return a redacted placeholder so the token
+// value is never exposed in logs, fmt output, or panic stack traces.
+type BotToken struct{ value string }
+
+func newBotToken(s string) BotToken { return BotToken{value: s} }
+
+// String returns a redacted placeholder.
+func (t BotToken) String() string { return "<REDACTED>" }
+
+// GoString returns a redacted placeholder.
+func (t BotToken) GoString() string { return `BotToken("<REDACTED>")` }
+
+// sanitizeError replaces any bot token embedded in a URL inside an error
+// message with a redacted placeholder.
+func sanitizeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(tokenURLPattern.ReplaceAllString(err.Error(), "/bot<REDACTED>/"))
+}
 
 type (
 	Chat struct {
@@ -72,21 +101,27 @@ type (
 )
 
 func main() {
-	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if botToken == "" {
+	rawToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if rawToken == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN environment variable is required")
 	}
+	botToken := newBotToken(rawToken)
+
+	// Create the HTTP client here and pass it explicitly to every API function
+	// to keep the scope of the client clear and prevent unintended reuse.
+	httpClient := &http.Client{Timeout: httpClientTTL}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	userInfo, err := getBotInfo(botToken)
+	userInfo, err := getBotInfo(httpClient, botToken)
 	if err != nil {
 		log.Fatalf("Error validating bot token: %v", err)
 	}
 	log.Printf("Started %s (@%s, %d)!", userInfo.Name, userInfo.Username, userInfo.ID)
 
 	var lastUpdateID int
+	var attempt int
 
 	for {
 		select {
@@ -96,7 +131,7 @@ func main() {
 		default:
 		}
 
-		updates, err := getUpdates(ctx, botToken, lastUpdateID+1)
+		updates, err := getUpdates(ctx, httpClient, botToken, lastUpdateID+1)
 		if err != nil {
 			if ctx.Err() != nil {
 				log.Println("Shutdown signal received, exiting")
@@ -104,9 +139,18 @@ func main() {
 			}
 
 			log.Printf("Error fetching updates: %v", err)
-			time.Sleep(retryDelay)
+
+			// Exponential back-off with up to 50% jitter, capped at retryMaxDelay.
+			delay := retryBaseDelay * (1 << min(attempt, 6)) // 2^6 * 5s ≈ 5 min
+			if delay > retryMaxDelay {
+				delay = retryMaxDelay
+			}
+			delay += time.Duration(rand.Int63n(int64(delay / 2)))
+			time.Sleep(delay)
+			attempt++
 			continue
 		}
+		attempt = 0
 
 		for _, update := range updates {
 			lastUpdateID = update.UpdateID
@@ -129,33 +173,33 @@ func main() {
 				continue
 			}
 
-			if err := sendChatAction(ctx, botToken, chatID, "upload_document"); err != nil {
+			if err := sendChatAction(ctx, httpClient, botToken, chatID, "upload_document"); err != nil {
 				log.Printf("Error sending chat action: %v", err)
 			}
-			if err := sendDocument(ctx, botToken, chatID, filename, update.RawJSON, messageID); err != nil {
+			if err := sendDocument(ctx, httpClient, botToken, chatID, filename, update.RawJSON, messageID); err != nil {
 				log.Printf("Error sending file: %v", err)
 			}
 		}
 	}
 }
 
-func getBotInfo(botToken string) (*BotInfo, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", botToken)
+func getBotInfo(httpClient *http.Client, botToken BotToken) (*BotInfo, error) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", botToken.value)
 
-	resp, err := client.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("API request error: %v", err)
+		return nil, fmt.Errorf("API request error: %w", sanitizeError(err))
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("error reading response: %v", err)
+		return nil, fmt.Errorf("error reading response: %w", err)
 	}
 
 	var result botInfoResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("error parsing JSON response: %v", err)
+		return nil, fmt.Errorf("error parsing JSON response: %w", err)
 	}
 
 	if !result.OK {
@@ -165,8 +209,8 @@ func getBotInfo(botToken string) (*BotInfo, error) {
 	return &result.Result, nil
 }
 
-func sendChatAction(parentCtx context.Context, botToken string, chatID int64, action string) error {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendChatAction", botToken)
+func sendChatAction(parentCtx context.Context, httpClient *http.Client, botToken BotToken, chatID int64, action string) error {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendChatAction", botToken.value)
 
 	payload := map[string]any{
 		"chat_id": chatID,
@@ -175,7 +219,7 @@ func sendChatAction(parentCtx context.Context, botToken string, chatID int64, ac
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("error marshaling payload: %v", err)
+		return fmt.Errorf("error marshaling payload: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(parentCtx, apiActionTimeout)
@@ -183,33 +227,33 @@ func sendChatAction(parentCtx context.Context, botToken string, chatID int64, ac
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("error creating request: %v", err)
+		return fmt.Errorf("error creating request: %w", sanitizeError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	return doAPIRequest(req)
+	return doAPIRequest(httpClient, req)
 }
 
-func getUpdates(parentCtx context.Context, botToken string, offset int) ([]Update, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=%d", botToken, offset, longPollTimeout)
+func getUpdates(parentCtx context.Context, httpClient *http.Client, botToken BotToken, offset int) ([]Update, error) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=%d", botToken.value, offset, longPollTimeout)
 
 	ctx, cancel := context.WithTimeout(parentCtx, getUpdatesCtxTTL)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("error creating request: %v", err)
+		return nil, fmt.Errorf("error creating request: %w", sanitizeError(err))
 	}
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("API request error: %v", err)
+		return nil, fmt.Errorf("API request error: %w", sanitizeError(err))
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("error reading response: %v", err)
+		return nil, fmt.Errorf("error reading response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -218,7 +262,7 @@ func getUpdates(parentCtx context.Context, botToken string, offset int) ([]Updat
 
 	var result updatesResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("error parsing JSON response: %v", err)
+		return nil, fmt.Errorf("error parsing JSON response: %w", err)
 	}
 
 	if !result.OK {
@@ -239,59 +283,59 @@ func getUpdates(parentCtx context.Context, botToken string, offset int) ([]Updat
 	return updates, nil
 }
 
-func sendDocument(parentCtx context.Context, botToken string, chatID int64, filename, content string, messageID int) error {
+func sendDocument(parentCtx context.Context, httpClient *http.Client, botToken BotToken, chatID int64, filename, content string, messageID int) error {
 	var requestBody bytes.Buffer
 	writer := multipart.NewWriter(&requestBody)
 
 	if err := writer.WriteField("chat_id", fmt.Sprintf("%d", chatID)); err != nil {
-		return fmt.Errorf("error writing chat_id field: %v", err)
+		return fmt.Errorf("error writing chat_id field: %w", err)
 	}
 
 	replyParamsJSON, err := json.Marshal(ReplyParameters{MessageID: messageID})
 	if err != nil {
-		return fmt.Errorf("error marshaling reply parameters: %v", err)
+		return fmt.Errorf("error marshaling reply parameters: %w", err)
 	}
 	if err := writer.WriteField("reply_parameters", string(replyParamsJSON)); err != nil {
-		return fmt.Errorf("error writing reply_parameters field: %v", err)
+		return fmt.Errorf("error writing reply_parameters field: %w", err)
 	}
 
 	part, err := writer.CreateFormFile("document", filename)
 	if err != nil {
-		return fmt.Errorf("error creating form file field: %v", err)
+		return fmt.Errorf("error creating form file field: %w", err)
 	}
 
 	if _, err := io.Copy(part, strings.NewReader(formatJSON(content))); err != nil {
-		return fmt.Errorf("error writing file data: %v", err)
+		return fmt.Errorf("error writing file data: %w", err)
 	}
 
 	if err := writer.Close(); err != nil {
-		return fmt.Errorf("error closing multipart writer: %v", err)
+		return fmt.Errorf("error closing multipart writer: %w", err)
 	}
 
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botToken)
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botToken.value)
 
 	ctx, cancel := context.WithTimeout(parentCtx, apiSendTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, &requestBody)
 	if err != nil {
-		return fmt.Errorf("error creating request: %v", err)
+		return fmt.Errorf("error creating request: %w", sanitizeError(err))
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	return doAPIRequest(req)
+	return doAPIRequest(httpClient, req)
 }
 
-func doAPIRequest(req *http.Request) error {
-	resp, err := client.Do(req)
+func doAPIRequest(httpClient *http.Client, req *http.Request) error {
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("error sending request: %v", err)
+		return fmt.Errorf("error sending request: %w", sanitizeError(err))
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
-		return fmt.Errorf("error reading response: %v", err)
+		return fmt.Errorf("error reading response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -300,7 +344,7 @@ func doAPIRequest(req *http.Request) error {
 
 	var apiResp apiResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return fmt.Errorf("error parsing response: %v", err)
+		return fmt.Errorf("error parsing response: %w", err)
 	}
 
 	if !apiResp.OK {
